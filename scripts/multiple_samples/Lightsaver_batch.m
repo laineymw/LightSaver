@@ -11,10 +11,11 @@ prompt = {'Enter number of worms to detect: ', ...
     'Remove 001,002, etc, from tif names - yes(1) - no(0) Will overwrite data files',...
     'Export processed images - yes (1) - no (0)',...
     'Automaic data analysis and export - yes (1) - no (0)',...
-    'Does the experiment folder have condition names in it? (ex: 01-1-11_N2_vs_SKN-1) - yes (1) - no (0)'};
+    'Does the experiment folder have condition names in it? (ex: 01-1-11_N2_vs_SKN-1) - yes (1) - no (0)',...
+    'Export worm size in square mm - yes (1) - no (0)'};
 dlgtitle = 'User Inputs for Lightsaver';
 dims = [1 100];
-definput = {'5','0','0','','1','1','1','0'};
+definput = {'5','0','0','','1','1','1','0','0'};
 answer = inputdlg(prompt,dlgtitle,dims,definput);
 
 if isempty(answer)
@@ -29,6 +30,7 @@ rename_tifs_choice = str2double(answer{5});
 export_processed_images = str2double(answer{6});
 data_analysis_and_export_bool = str2double(answer{7});
 experimental_name_has_conditions_in_it = str2double(answer{8});
+show_worm_size_mm = str2double(answer{9});
 
 % this is for the exported images 
 % faster is with the jpg format -> 0 but less quality on the images
@@ -90,6 +92,8 @@ img_paths = img_paths(sort_idx);
 
 image_integral_intensities = zeros(length(img_paths),number_worms_to_detect);
 image_integral_area = zeros(length(img_paths),number_worms_to_detect);
+image_conversion_area = zeros(length(img_paths),number_worms_to_detect);
+image_mm_area = zeros(length(img_paths),number_worms_to_detect);
 
 se = strel('disk',5);
 progress_bar = 0;
@@ -98,11 +102,11 @@ for i = 1:length(img_paths)
     
     progress_bar = progressbar_function(i,length(img_paths),progress_bar);
     
-    [data,this_img] = load_fluor_image(img_dir_path,img_paths,i);
-    
+    [data,this_img,image_conversion_area] = load_fluor_image(img_dir_path,img_paths,i,number_worms_to_detect, image_conversion_area);
+
     % testing to measure scale from exported image with ocr
     %     [out,this_measurement] = ocr_pixel_scale(this_img);
-    
+
     % this assumes that all the data is in the uint8 format
     data_norm = double(data)/255;
     
@@ -235,6 +239,8 @@ for i = 1:length(img_paths)
 end
 close_progressbar(progress_bar)
 
+image_mm_area = image_conversion_area .* image_integral_area;
+
 output_csv = cell(1 + length(img_paths),11);
 
 output_header = {'Image names',...
@@ -244,10 +250,20 @@ output_header = {'Image names',...
     'Worm 1 (blue) integrated Area','Worm 2 (teal) integrated Area',...
     'Worm 3 (green) integrated Area','Worm 4 (yellow/red) integrated Area',...
     'Worm 5 (orange) integrated Area'};
+if show_worm_size_mm
+    extra_header = {'Image conversion factor (square mm/square pixels)',...
+        'Worm 1 (blue) area in sqr mm',...
+        'Worm 2 (teal) area in sqr mm','Worm 3 (green) area in sqr mm',...
+        'Worm 4 (yellow/red) area in sqr mm', 'Worm 5 (orange) area in sqr mm'};
+    output_header = [output_header, extra_header];
+    output_csv = cell(1 + length(img_paths),17);
+end
 
 output_csv(1,:) = output_header;
 output_csv(2:end,2:6) = num2cell(image_integral_intensities);
 output_csv(2:end,7:11) = num2cell(image_integral_area);
+output_csv(2:end,12) = num2cell(image_conversion_area(:,1));
+output_csv(2:end,13:17) = num2cell(image_mm_area);
 for i = 1:length(img_paths)
     output_csv{i+1,1} = img_names{i};
 end
@@ -269,7 +285,7 @@ disp(' ')
 disp('End of scrip')
 
 
-function [data,this_img] = load_fluor_image(img_dir_path,img_paths,i)
+function [data,this_img,image_conversion_area] = load_fluor_image(img_dir_path,img_paths,i,number_worms_to_detect,image_conversion_area)
 % read the image into ram
 
 [~,this_img_name,~] = fileparts(img_paths{i});
@@ -324,6 +340,92 @@ else % else the image is grayscale
     % get rid of the scale bar
     data(end-100:end,1:256) = 0;
 end
+
+% Process image for ocr
+croppedImage = this_img(end-100:end, 1:270);
+BW = im2bw(croppedImage);
+
+% Convert to logical array (assuming it's a binary image)
+logicalImage = logical(BW);
+BW = imresize(BW, 2);
+
+% Perform connected component labeling
+cc = bwconncomp(logicalImage);
+
+% Initialize variable to store the conversion factor
+conversion = NaN; 
+
+% Measure properties of connected components
+props = regionprops(cc, 'PixelList');
+
+% Initialize variable to store the length of the longest line
+max_length = 0;
+
+% Iterate over each connected component
+for j = 1:length(props)
+    % Fit a line to the points of the connected component
+    points = props(j).PixelList;
+    [coefficients, ~] = polyfit(points(:,1), points(:,2), 1);
+    
+    % Calculate the endpoints of the line
+    x_values = [min(points(:,1)), max(points(:,1))];
+    y_values = polyval(coefficients, x_values);
+    line_endpoints = [x_values', y_values'];
+    
+    % Calculate the length of the line (ignoring width)
+    length_line = norm(line_endpoints(1,:) - line_endpoints(2,:));
+    
+    % Update the maximum length if the current line is longer
+    if length_line > max_length
+        max_length = length_line;
+        longest_line = line_endpoints;
+    end
+end
+
+% Use OCR to read the image text
+customCharacterSet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789μ.';
+ocrResults = ocr(BW, 'CharacterSet', customCharacterSet, LayoutAnalysis="character");
+
+
+% Extract value and units from scale text
+imageText = strtrim(ocrResults.Text);
+value = imageText(1:end-2);
+units = imageText(end-1:end);
+    
+% Create a struct to hold scale information
+scale = struct('Value', value, 'Units', units);
+
+if strcmpi(scale.Units, 'cm')  % Check if units are 'cm'
+    % Perform calculations for centimeters
+    scale_cm = str2double(scale.Value); % Convert value to numeric
+    conversion = (scale_cm * 10 / max_length)^2;
+
+% Check units and perform calculations accordingly
+elseif strcmpi(scale.Units, 'mm')  
+    % Perform calculations for millimeters
+    scale_mm = str2double(scale.Value); % Convert value to numeric
+    conversion = (scale_mm / max_length)^2;
+
+% Check units and perform calculations accordingly
+elseif strcmpi(scale.Units, 'μm') || strcmpi(scale.Units, 'ym') || strcmpi(scale.Units, 'um')
+    % Perform calculations for micrometers
+    scale_um = str2double(scale.Value); % Convert value to numeric
+    conversion = (scale_um / 1000 / max_length)^2;
+    
+elseif strcmpi(scale.Units, 'nm')  
+    % Perform calculations for nanometers
+    scale_nm = str2double(scale.Value); % Convert value to numeric
+    conversion = (scale_nm / 1000000 / max_length)^2;
+    
+else
+    disp('Unknown units. Cannot perform calculations.');
+    conversion = NaN; % Assign NaN if units are unknow
+    disp(['Value is: ', num2str(value)]);
+    disp(['Units are: ', units]);
+end
+
+% update conversion area after each loop
+image_conversion_area(i,1:number_worms_to_detect) = repmat(conversion, 1, number_worms_to_detect);
 
 end
 
